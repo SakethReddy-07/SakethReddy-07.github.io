@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Wireshark Deep Dive: Detecting Lateral Movement | Saketh Reddy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg:#060d1a; --bg2:#09122a;
+      --cyan:#00d4ff; --cyan2:#00b8e0;
+      --amber:#ff8c42; --purple:#7c6ff7;
+      --white:#f0f6ff; --text:#8bafc8; --muted:#3d5a78;
+      --mono:'Share Tech Mono',monospace;
+      --display:'Exo 2',sans-serif;
+      --body:'Rajdhani',sans-serif;
+      --border:rgba(255,255,255,0.07);
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);font-family:var(--body);font-size:1.05rem;line-height:1.8;min-height:100vh}
+    a{color:var(--purple);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .blog-nav{display:flex;align-items:center;justify-content:space-between;padding:1.2rem 2rem;border-bottom:1px solid var(--border);position:sticky;top:0;background:rgba(6,13,26,0.92);backdrop-filter:blur(12px);z-index:100}
+    .blog-nav .logo{font-family:var(--mono);color:var(--cyan);font-size:.9rem}
+    .back-btn{font-family:var(--mono);font-size:.75rem;color:var(--text);border:1px solid rgba(124,111,247,0.3);border-radius:6px;padding:.35rem .9rem;transition:all .2s}
+    .back-btn:hover{background:rgba(124,111,247,0.08);color:var(--purple);text-decoration:none}
+    .blog-hero{max-width:820px;margin:0 auto;padding:4rem 2rem 2rem}
+    .blog-category{display:inline-block;font-family:var(--mono);font-size:.65rem;letter-spacing:2px;color:var(--purple);background:rgba(124,111,247,0.1);border:1px solid rgba(124,111,247,0.25);border-radius:20px;padding:.25rem .85rem;margin-bottom:1.2rem}
+    .blog-title{font-family:var(--display);font-size:clamp(1.6rem,4vw,2.6rem);font-weight:900;color:var(--white);line-height:1.2;margin-bottom:1rem}
+    .blog-title span{color:var(--purple)}
+    .blog-meta-row{display:flex;align-items:center;gap:1.5rem;font-family:var(--mono);font-size:.7rem;color:var(--muted);margin-bottom:2rem;flex-wrap:wrap}
+    .blog-meta-row .tag{background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:4px;padding:.15rem .5rem}
+    .blog-divider{height:1px;background:linear-gradient(90deg,var(--purple),transparent);margin-bottom:3rem;opacity:.3}
+    .blog-content{max-width:820px;margin:0 auto;padding:0 2rem 5rem}
+    .blog-content h2{font-family:var(--display);font-size:1.35rem;font-weight:800;color:var(--white);margin:2.5rem 0 .8rem;padding-left:.8rem;border-left:3px solid var(--purple)}
+    .blog-content h3{font-family:var(--display);font-size:1.05rem;font-weight:700;color:var(--purple);margin:1.8rem 0 .6rem}
+    .blog-content p{color:var(--text);margin-bottom:1.1rem}
+    .blog-content strong{color:var(--white)}
+    .blog-content ul,.blog-content ol{padding-left:1.5rem;margin-bottom:1.1rem}
+    .blog-content li{color:var(--text);margin-bottom:.4rem}
+    .blog-content li::marker{color:var(--purple)}
+    .code-block{background:#060f1e;border:1px solid rgba(124,111,247,0.15);border-left:3px solid var(--purple);border-radius:8px;padding:1.2rem 1.5rem;margin:1.2rem 0;overflow-x:auto}
+    .code-block pre{font-family:var(--mono);font-size:.82rem;color:#c4b5fd;line-height:1.7;white-space:pre}
+    .code-label{font-family:var(--mono);font-size:.6rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;margin-bottom:.5rem}
+    .callout{border-radius:8px;padding:1rem 1.2rem;margin:1.5rem 0;border-left:3px solid}
+    .callout.info{background:rgba(0,212,255,0.06);border-color:var(--cyan)}
+    .callout.warn{background:rgba(255,140,66,0.06);border-color:var(--amber)}
+    .callout.success{background:rgba(74,222,128,0.06);border-color:#4ade80}
+    .callout.threat{background:rgba(239,68,68,0.06);border-color:#ef4444}
+    .callout p{margin:0;font-size:.95rem}
+    .callout-title{font-family:var(--mono);font-size:.65rem;letter-spacing:2px;text-transform:uppercase;margin-bottom:.4rem}
+    .callout.info .callout-title{color:var(--cyan)}
+    .callout.warn .callout-title{color:var(--amber)}
+    .callout.success .callout-title{color:#4ade80}
+    .callout.threat .callout-title{color:#ef4444}
+    .blog-footer-tags{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:3rem;padding-top:2rem;border-top:1px solid var(--border)}
+    .blog-footer-tags span{font-family:var(--mono);font-size:.65rem;color:var(--text);background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:4px;padding:.2rem .6rem}
+  </style>
+</head>
+<body>
+
+  <nav class="blog-nav">
+    <div class="logo">&gt;_ SAKETH.REDDY</div>
+    <a href="index.html" class="back-btn">&#8592; Back to Portfolio</a>
+  </nav>
+
+  <div class="blog-hero">
+    <div class="blog-category">NETWORK SECURITY</div>
+    <h1 class="blog-title">Wireshark Deep Dive: Detecting <span>Lateral Movement</span></h1>
+    <div class="blog-meta-row">
+      <span>Mar 1, 2025</span>
+      <span class="tag">Wireshark</span>
+      <span class="tag">PCAP Analysis</span>
+      <span class="tag">Kerberoasting</span>
+      <span class="tag">~14 min read</span>
+    </div>
+    <div class="blog-divider"></div>
+  </div>
+
+  <div class="blog-content">
+
+    <p>Once an attacker establishes a foothold, lateral movement is how they spread through a network to reach high-value targets. Most of this movement generates distinctive network patterns that are invisible to endpoint tools but clearly visible in packet captures. This post covers how to spot the most common lateral movement techniques in Wireshark.</p>
+
+    <h2>Setting Up Your Wireshark Environment</h2>
+    <p>Before diving into detection, configure Wireshark for efficient threat hunting:</p>
+
+    <div class="code-block">
+      <div class="code-label">Key display filter shortcuts to know</div>
+      <pre>-- Filter by protocol:
+smb2          -- SMB v2 traffic
+kerberos      -- Kerberos auth packets
+ntlmssp       -- NTLM authentication
+ldap          -- LDAP queries
+
+-- Combine filters:
+smb2 && ip.src == 192.168.1.50
+kerberos && kerberos.msg_type == 30   -- TGS-REQ</pre>
+    </div>
+
+    <div class="callout info">
+      <div class="callout-title">&#9432; Pro Tip</div>
+      <p>Use <strong>Statistics → Conversations</strong> to quickly spot hosts making an unusual number of connections. A single host connecting to 20+ internal IPs in seconds is almost always scanning or moving laterally.</p>
+    </div>
+
+    <h2>Detecting Pass-the-Hash (PtH)</h2>
+    <p>Pass-the-Hash attacks use stolen NTLM hashes to authenticate without knowing the plaintext password. The network signature is NTLM authentication where the username appears on an unusual source host.</p>
+
+    <h3>What to Look For</h3>
+    <div class="code-block">
+      <div class="code-label">Wireshark display filter</div>
+      <pre>ntlmssp.auth.username && smb2
+
+-- Drill into NTLMSSP packets and check:
+-- NTLMSSP_AUTH → NtChallengeResponse (length 24 = LM hash, longer = NT hash)
+-- Workstation name doesn't match the source IP hostname</pre>
+    </div>
+
+    <div class="callout threat">
+      <div class="callout-title">&#9888; Red Flag</div>
+      <p>NTLM authentication from a workstation to multiple servers in rapid succession, especially to <strong>ADMIN$</strong> or <strong>C$</strong> shares, is a strong PtH indicator. Legitimate users don't normally authenticate to 10 machines in 30 seconds.</p>
+    </div>
+
+    <h3>SMB Tree Connect to Admin Shares</h3>
+    <div class="code-block">
+      <div class="code-label">Filter for admin share access</div>
+      <pre>smb2.tree contains "ADMIN$" or smb2.tree contains "C$" or smb2.tree contains "IPC$"
+
+-- Legitimate use: IT admins, some backup software
+-- Suspicious: any non-admin workstation, or rapid sequential connections</pre>
+    </div>
+
+    <h2>Detecting Kerberoasting</h2>
+    <p>Kerberoasting requests Kerberos service tickets (TGS) for service accounts, then cracks them offline. The attack generates TGS-REQ packets for SPNs that the attacker normally wouldn't access.</p>
+
+    <h3>TGS-REQ Flood — The Key Signature</h3>
+    <div class="code-block">
+      <div class="code-label">Kerberoasting detection filter</div>
+      <pre>kerberos.msg_type == 12   -- TGS-REP (service ticket granted)
+
+-- Look for:
+-- Many TGS-REQ packets from single host in short time
+-- Requests for unusual SPNs (MSSQLSvc, HTTP/*, CIFS/*)
+-- RC4 encryption type (etype 23) — weaker, easier to crack
+-- AES not used (attacker requests RC4 specifically)</pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">Filter for RC4 downgrade (Kerberoasting indicator)</div>
+      <pre>kerberos.etype == 23 && kerberos.msg_type == 12
+-- etype 23 = RC4-HMAC — attacker forced downgrade from AES
+-- etype 18 = AES256 — normal, not being Kerberoasted</pre>
+    </div>
+
+    <div class="callout warn">
+      <div class="callout-title">&#9888; Why RC4 Matters</div>
+      <p>Attackers specifically request RC4-encrypted tickets because they crack 10x faster than AES. A host requesting multiple RC4 service tickets for different SPNs in under a minute is almost certainly Kerberoasting.</p>
+    </div>
+
+    <h2>Detecting WMI-Based Lateral Movement</h2>
+    <p>Windows Management Instrumentation (WMI) is heavily abused for remote code execution. It uses DCOM over dynamic ports, making it harder to filter than SMB.</p>
+
+    <div class="code-block">
+      <div class="code-label">WMI / DCOM filter</div>
+      <pre>-- DCOM traffic (WMI uses this)
+dcerpc && tcp.dstport == 135
+
+-- After initial DCOM negotiation, look for dynamic high ports:
+dcerpc && tcp.dstport > 49152
+
+-- WMI exec signature: IWbemServices::ExecMethod calls
+-- Look for: "Win32_Process" and "Create" in DCERPC payloads</pre>
+    </div>
+
+    <div class="code-block">
+      <div class="code-label">Tshark extraction — WMI method calls</div>
+      <pre>tshark -r capture.pcap -Y "dcerpc" \
+  -T fields -e ip.src -e ip.dst -e dcerpc.opnum \
+  | sort | uniq -c | sort -rn</pre>
+    </div>
+
+    <h2>Detecting Mimikatz / LSASS Dumping via Network</h2>
+    <p>While LSASS dumping is a local operation, the credentials harvested are immediately used for lateral movement. Look for authentication bursts following unusual process activity on a host:</p>
+
+    <div class="code-block">
+      <div class="code-label">Post-credential-dump network pattern</div>
+      <pre>-- Within seconds/minutes of LSASS dump:
+-- Sudden burst of SMB/Kerberos auth from one host
+-- Auth attempts to DC (88/tcp Kerberos) in rapid succession
+-- New hosts being accessed that the workstation never touched before
+
+-- Filter: all auth from a suspect host in a time window
+(smb2 || kerberos || ntlmssp) && ip.src == 192.168.1.100</pre>
+    </div>
+
+    <h2>Detecting PsExec Remote Execution</h2>
+    <p>PsExec is one of the most common lateral movement tools. It creates a named pipe over SMB and drops a service binary on the remote host.</p>
+
+    <div class="code-block">
+      <div class="code-label">PsExec signature in Wireshark</div>
+      <pre>-- Step 1: SMB connect to ADMIN$ share
+smb2.tree contains "ADMIN$"
+
+-- Step 2: Named pipe creation — PSEXESVC
+smb2.filename contains "PSEXESVC"
+
+-- Step 3: Service control manager activity over SVCCTL pipe
+smb2.filename contains "svcctl"
+
+-- Combined filter:
+smb2 && (smb2.filename contains "PSEXESVC" || smb2.filename contains "svcctl")</pre>
+    </div>
+
+    <div class="callout success">
+      <div class="callout-title">&#10003; Detection Summary</div>
+      <p>PsExec always leaves a distinct trail: ADMIN$ tree connect → PSEXESVC binary write → svcctl pipe → service start. This 4-step sequence in Wireshark is near-definitive proof of PsExec lateral movement.</p>
+    </div>
+
+    <h2>Tshark One-Liners for PCAP Forensics</h2>
+    <p>When working with large PCAPs, Wireshark's GUI is too slow. Tshark on the command line is essential:</p>
+
+    <div class="code-block">
+      <div class="code-label">Tshark forensic one-liners</div>
+      <pre># Top talkers
+tshark -r capture.pcap -q -z conv,ip | sort -k3 -rn | head -20
+
+# All SMB filenames accessed
+tshark -r capture.pcap -Y smb2 -T fields -e smb2.filename | sort -u
+
+# All Kerberos service ticket requests + SPN
+tshark -r capture.pcap -Y "kerberos.msg_type==12" \
+  -T fields -e ip.src -e kerberos.SNameString
+
+# All NTLM usernames seen
+tshark -r capture.pcap -Y ntlmssp \
+  -T fields -e ip.src -e ntlmssp.auth.username | sort -u
+
+# DNS queries (C2 beaconing detection)
+tshark -r capture.pcap -Y dns -T fields \
+  -e ip.src -e dns.qry.name | sort | uniq -c | sort -rn</pre>
+    </div>
+
+    <h2>Key Takeaways</h2>
+    <ul>
+      <li>Lateral movement leaves network fingerprints — each technique has a distinct packet signature</li>
+      <li>Pass-the-Hash: NTLM auth from unexpected hosts to ADMIN$ shares in rapid bursts</li>
+      <li>Kerberoasting: many TGS-REQ with RC4 (etype 23) from a single host in seconds</li>
+      <li>PsExec: always creates PSEXESVC named pipe over SMB — unmistakable in PCAP</li>
+      <li>Use Tshark for large PCAPs — GUI is too slow; scripted analysis finds patterns faster</li>
+      <li>Statistics → Conversations is your first stop — outliers stand out immediately</li>
+    </ul>
+
+    <div class="blog-footer-tags">
+      <span>Wireshark</span><span>PCAP</span><span>Lateral Movement</span>
+      <span>Kerberoasting</span><span>Pass-the-Hash</span><span>PsExec</span>
+      <span>NTLM</span><span>Tshark</span>
+    </div>
+
+  </div>
+
+</body>
+</html>
