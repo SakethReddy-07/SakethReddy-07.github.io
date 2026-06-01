@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Wireshark: Detecting Lateral Movement | Saketh Reddy</title>
+<link rel="stylesheet" href="blog-style.css"/>
+</head>
+<body>
+<div id="cur"></div><div id="cur-r"></div>
+<canvas id="bg-canvas"></canvas>
+<div id="grain"></div><div id="vig"></div><div id="scl"></div>
+
+<nav class="bnav">
+  <a href="index.html" class="bnav-logo">&gt;_<span>SAKETH</span>.REDDY</a>
+  <a href="index.html" class="bnav-back">← Back to Portfolio</a>
+</nav>
+
+<div class="bhero">
+  <div class="bcat bcat-p">Network Security</div>
+  <h1 class="btitle">Wireshark Deep Dive:<br>Detecting <span>Lateral Movement</span></h1>
+  <div class="bmeta">
+    <span>Mar 1, 2025</span>
+    <span class="bmeta-tag">Wireshark</span>
+    <span class="bmeta-tag">Network Forensics</span>
+    <span class="bmeta-tag">Blue Team</span>
+    <span class="bmeta-tag">~18 min read</span>
+  </div>
+  <div class="bhero-line"></div>
+</div>
+
+<div class="bcontent">
+  <p>Lateral movement is what separates a contained breach from a full network compromise. Attackers who've gained an initial foothold use techniques like Pass-the-Hash, Kerberoasting, PsExec, and WMI to spread through the network. This guide shows exactly how to spot these in Wireshark packet captures using targeted display filters and Tshark one-liners.</p>
+
+  <h2>Setting Up Your Analysis Environment</h2>
+  <p>Before diving into filters, set up Wireshark for efficient lateral movement analysis:</p>
+  <div class="cb">
+    <div class="cb-lbl">Wireshark Profile Setup</div>
+    <pre># Enable these columns:
+# Time, Source, Destination, Protocol, Length, Info
+
+# Key preferences:
+# Edit > Preferences > Name Resolution
+# - Enable "Resolve network (IP) addresses"
+# - Enable "Resolve transport names"
+
+# Color rules for quick triage:
+# Red:    tcp.flags.reset==1 (RST flood = scanning)
+# Orange: smb || smb2       (SMB traffic)
+# Purple: kerberos          (Kerberos auth)
+# Blue:   ntlmssp           (NTLM auth)</pre>
+  </div>
+
+  <h2>Detecting Pass-the-Hash</h2>
+  <p>Pass-the-Hash (PtH) allows attackers to authenticate using just the NTLM hash — no plaintext password needed. The telltale sign is NTLM authentication from unexpected sources:</p>
+  <div class="cb">
+    <div class="cb-lbl">Wireshark Display Filter — PtH Detection</div>
+    <pre># Spot NTLM authentication attempts
+ntlmssp.auth.username
+
+# NTLM over SMB — most common PtH vector
+smb2 && ntlmssp
+
+# Failed NTLM auths in bulk = spray/PtH attempt
+ntlmssp.auth && (smb2.nt_status == 0xC000006D ||
+                 smb2.nt_status == 0xC0000064)
+
+# SMB auth from non-standard sources (not DC)
+smb2 && ntlmssp.auth.username && 
+  !(ip.src == 192.168.1.10)  # substitute your DC IP</pre>
+  </div>
+  <div class="co co-info">
+    <div class="co-title">ℹ What to Look For</div>
+    <p>Successful NTLM auths from workstations to other workstations (lateral) rather than workstation → DC (normal). Also watch for the same hash authenticating from multiple sources within a short timeframe.</p>
+  </div>
+
+  <h2>Detecting Kerberoasting</h2>
+  <p>Kerberoasting requests service tickets (TGS) for service accounts, then cracks them offline. Look for unusual TGS-REQ patterns:</p>
+  <div class="cb">
+    <div class="cb-lbl">Wireshark — Kerberoasting Filters</div>
+    <pre># All Kerberos TGS requests
+kerberos.msg_type == 12  # TGS-REQ
+
+# RC4 encryption in TGS (weak, crackable — red flag)
+kerberos.msg_type == 12 && kerberos.etype == 23
+
+# Multiple TGS-REQ from same source in short time
+# Use Statistics > Conversations after filtering kerberos
+# Look for one IP making 10+ TGS requests rapidly
+
+# Full Kerberoasting detection filter
+kerberos && kerberos.msg_type == 12 && 
+  kerberos.etype == 23 &&
+  kerberos.req_body_cname</pre>
+  </div>
+  <div class="cb">
+    <div class="cb-lbl">Tshark — Extract Kerberoasting Indicators</div>
+    <pre">tshark -r capture.pcap \
+  -Y "kerberos.msg_type==12 && kerberos.etype==23" \
+  -T fields \
+  -e ip.src \
+  -e ip.dst \
+  -e kerberos.req_body_cname \
+  -e frame.time \
+  | sort | uniq -c | sort -rn</pre>
+  </div>
+
+  <h2>Detecting PsExec</h2>
+  <p>PsExec creates a temporary service on the remote host via SMB. The named pipe and service creation pattern is distinctive:</p>
+  <div class="cb">
+    <div class="cb-lbl">Wireshark — PsExec Detection</div>
+    <pre"># PsExec creates PSEXESVC service via SMB pipe
+smb2.filename contains "PSEXESVC"
+
+# More generic — service creation over SMB named pipe
+smb2.filename contains "svcctl"
+
+# Service manager calls over SMB (DCE/RPC)
+dcerpc && smb2 && 
+  (dcerpc.cmd == 15 || dcerpc.cmd == 12)  # CreateService, StartService
+
+# Full PsExec chain filter
+smb2 && (smb2.filename contains "PSEXESVC" || 
+         smb2.filename contains "svcctl" ||
+         smb2.filename contains "admin$")</pre>
+  </div>
+
+  <h2>Detecting WMI-Based Movement</h2>
+  <p>WMI (Windows Management Instrumentation) is a popular living-off-the-land technique. It uses DCOM over TCP port 135 + a dynamic high port:</p>
+  <div class="cb">
+    <div class="cb-lbl">Wireshark — WMI / DCOM Detection</div>
+    <pre"># DCOM initial connection (port 135)
+tcp.port == 135 && dcerpc
+
+# WMI over DCOM — process creation (most dangerous)
+# Look for DCOM traffic followed by dynamic port (>1024) from same pair
+dcerpc && ip.dst == [target_ip]
+
+# Tshark — find DCOM conversations
+tshark -r capture.pcap \
+  -Y "tcp.port==135 && dcerpc" \
+  -T fields -e ip.src -e ip.dst \
+  | sort | uniq -c | sort -rn
+
+# impacket wmiexec leaves this pattern:
+# Source → 135/tcp (DCOM bind)
+# Source → [dynamic port] (actual WMI call)
+# 2 connections from same src within 1 second</pre>
+  </div>
+
+  <h2>Tshark One-Liners for Rapid Triage</h2>
+  <div class="cb">
+    <div class="cb-lbl">Production Tshark Commands</div>
+    <pre"># Top talkers by byte count
+tshark -r capture.pcap -q -z conv,ip | head -20
+
+# All SMB tree connects (reveals share access)
+tshark -r capture.pcap -Y smb2.cmd==3 \
+  -T fields -e ip.src -e smb2.tree | sort | uniq -c
+
+# Failed auth attempts (spray detection)
+tshark -r capture.pcap \
+  -Y "ntlmssp.auth && smb2.nt_status==0xC000006D" \
+  -T fields -e ip.src -e ntlmssp.auth.username \
+  | sort | uniq -c | sort -rn
+
+# Detect port scanning (RST flood)
+tshark -r capture.pcap -Y "tcp.flags.reset==1" \
+  -T fields -e ip.src -e ip.dst -e tcp.dstport \
+  | awk '{print $1}' | sort | uniq -c | sort -rn | head
+
+# Extract all DNS queries
+tshark -r capture.pcap -Y dns.qry.name \
+  -T fields -e dns.qry.name | sort | uniq
+
+# Find cleartext credentials (basic auth, FTP, etc.)
+tshark -r capture.pcap \
+  -Y "http.authorization || ftp.request.command==PASS" \
+  -T fields -e ip.src -e http.authorization -e ftp.request.arg</pre>
+  </div>
+
+  <h2>Building a Lateral Movement Timeline</h2>
+  <p>Once you've identified suspicious traffic, reconstruct the attacker's timeline:</p>
+  <div class="cb">
+    <div class="cb-lbl">Timeline Reconstruction</div>
+    <pre"># Export to CSV for timeline analysis
+tshark -r capture.pcap \
+  -Y "smb2 || kerberos || ntlmssp || dcerpc" \
+  -T fields \
+  -e frame.time_epoch \
+  -e ip.src -e ip.dst \
+  -e _ws.col.Protocol \
+  -e _ws.col.Info \
+  -E separator=, -E quote=d \
+  > lateral_timeline.csv
+
+# Then in Python:
+import pandas as pd
+df = pd.read_csv('lateral_timeline.csv',
+  names=['time','src','dst','proto','info'])
+df['time'] = pd.to_datetime(df['time'], unit='s')
+df.sort_values('time').to_csv('sorted_timeline.csv')</pre>
+  </div>
+  <div class="co co-ok">
+    <div class="co-title">✓ Pro Tip</div>
+    <p>Always correlate packet timestamps with Windows Event Log entries (Event IDs 4624, 4625, 4648, 7045) for full lateral movement attribution. Packet captures give the what; event logs give the who and how.</p>
+  </div>
+
+  <h2>Key Takeaways</h2>
+  <ul>
+    <li>PtH: Look for NTLM auths from workstation-to-workstation, especially with RC4</li>
+    <li>Kerberoasting: Bulk TGS-REQ with etype=23 (RC4) from one source = attacker collecting hashes</li>
+    <li>PsExec: The PSEXESVC string in SMB file names is the dead giveaway</li>
+    <li>WMI: DCOM on 135 followed immediately by dynamic port communication = remote process execution</li>
+    <li>Always sort by conversation frequency — attackers generate unusual traffic volumes</li>
+  </ul>
+
+  <div class="bfooter">
+    <span class="bftag">Wireshark</span><span class="bftag">Tshark</span><span class="bftag">Lateral Movement</span>
+    <span class="bftag">Pass-the-Hash</span><span class="bftag">Kerberoasting</span><span class="bftag">PsExec</span>
+    <span class="bftag">WMI</span><span class="bftag">Network Forensics</span>
+  </div>
+
+  <div class="bmore">
+    <h3>More Writeups</h3>
+    <div class="bmore-links">
+      <a href="blog-ssrf-htb.html" class="bmore-link">
+        <span class="bml-num">01</span>
+        <span class="bml-title">HackTheBox: Exploiting SSRF for Internal Recon</span>
+        <span class="bml-arr">→</span>
+      </a>
+      <a href="blog-sqli-advanced.html" class="bmore-link">
+        <span class="bml-num">02</span>
+        <span class="bml-title">Advanced SQL Injection: Beyond Basic UNION Attacks</span>
+        <span class="bml-arr">→</span>
+      </a>
+    </div>
+  </div>
+</div>
+
+<script src="blog-shared.js"></script>
+</body>
+</html>
